@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from qubex.backend.quel1.compat.box_adapter import adapt_quel1_box
 from qubex.backend.quel1.quel1_backend_constants import (
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from qubex.backend.quel1.compat.qubecalib_protocols import (
         BoxPoolProtocol as BoxPool,
         BoxSettingProtocol as BoxSetting,
+        ClockMasterProtocol,
         Quel1BoxCommonProtocol as Quel1Box,
         Quel1ConfigOptionProtocol as Quel1ConfigOption,
         Quel1SystemProtocol as Quel1System,
@@ -61,6 +62,18 @@ class _TerminableResource(Protocol):
 
 
 _DisconnectResource = _ClosableResource | _TerminableResource
+
+
+def create_quel_clock_master(ipaddr: str) -> Any:
+    """
+    Create the clock master of `quel_ic_config` owned by one connection.
+
+    It holds the lock of the clock master only, and takes the boxes to
+    synchronize at each `sync_boxes(boxes)`; `disconnect()` terminates it.
+    """
+    from quel_ic_config import QuelClockMasterV1
+
+    return QuelClockMasterV1(ipaddr=ipaddr)
 
 
 def _resolve_quel1se_r8_awg_option(options: list[str]) -> str:
@@ -252,6 +265,14 @@ class Quel1ConnectionManager:
             cap_resource_map = self._create_resource_map("cap")
             gen_resource_map = self._create_resource_map("gen")
         except Exception:
+            clockmaster = boxpool._clock_master
+            if (
+                self._runtime_context.driver.package_name != "qubecalib"
+                and clockmaster is not None
+            ):
+                self._disconnect_resource_safely(
+                    cast("ClockMasterProtocol", clockmaster)
+                )
             self.clear_connected_state()
             raise
         self.set_cap_resource_map(cap_resource_map)
@@ -512,11 +533,6 @@ class Quel1ConnectionManager:
         qubecalib = self._runtime_context.qubecalib
         db = qubecalib.system_config_database
         driver = self._runtime_context.driver
-        boxpool = driver.BoxPool()
-        clockmaster_setting = db._clockmaster_setting
-        if clockmaster_setting is not None:
-            boxpool.create_clock_master(ipaddr=str(clockmaster_setting.ipaddr))
-
         box_settings = db._box_settings
         settings_by_name: dict[str, BoxSetting] = {}
         for box_name in box_names:
@@ -524,6 +540,35 @@ class Quel1ConnectionManager:
                 raise ValueError(f"box({box_name}) is not defined")
             settings_by_name[box_name] = box_settings[box_name]
 
+        boxpool = driver.BoxPool()
+        clockmaster_setting = db._clockmaster_setting
+        if clockmaster_setting is None or driver.package_name == "qubecalib":
+            if clockmaster_setting is not None:
+                boxpool.create_clock_master(ipaddr=str(clockmaster_setting.ipaddr))
+            return self._connect_pooled_boxes(
+                boxpool, box_names, settings_by_name, parallel=parallel
+            )
+        clockmaster = create_quel_clock_master(str(clockmaster_setting.ipaddr))
+        boxpool.set_clock_master(clockmaster)
+        try:
+            return self._connect_pooled_boxes(
+                boxpool, box_names, settings_by_name, parallel=parallel
+            )
+        except BaseException:
+            self._disconnect_resource_safely(clockmaster)
+            raise
+
+    def _connect_pooled_boxes(
+        self,
+        boxpool: BoxPool,
+        box_names: list[str],
+        settings_by_name: dict[str, BoxSetting],
+        *,
+        parallel: bool,
+    ) -> BoxPool:
+        """Create the boxes of the pool and reconnect them."""
+        db = self._runtime_context.qubecalib.system_config_database
+        driver = self._runtime_context.driver
         boxes_to_reconnect: list[Quel1Box] = []
         if parallel and box_names:
 
@@ -588,8 +633,15 @@ class Quel1ConnectionManager:
             driver.NamedBox(name=box_name, box=boxpool._boxes[box_name][0])
             for box_name in box_names
         ]
+        clockmaster = (
+            driver.QuBEMasterClient(str(clockmaster_setting.ipaddr))
+            if driver.package_name == "qubecalib"
+            else boxpool._clock_master
+        )
+        if clockmaster is None:
+            raise ValueError("clock master is not found")
         return driver.Quel1System.create(
-            clockmaster=driver.QuBEMasterClient(str(clockmaster_setting.ipaddr)),
+            clockmaster=clockmaster,
             boxes=boxes,
             update_copnfig_cache=False,
         )

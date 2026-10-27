@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import yaml
 from rich.console import Console
 
+from qubex.backend.quel1.managers.connection_manager import create_quel_clock_master
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
 )
@@ -287,7 +288,13 @@ class Quel1SkewManager:
         target_box_names: list[str] | None = None,
         estimate: bool = True,
     ) -> tuple[SkewRuntimeProtocol, Any]:
-        """Run skew measurement workflow and return skew runtime and plot figure."""
+        """
+        Run skew measurement workflow and return skew runtime and plot figure.
+
+        Without a connection, the clock master of `quel_ic_config` created for the
+        measurement is terminated before returning, so the returned skew runtime
+        cannot resync again.
+        """
         resolved_box_names = list(dict.fromkeys(box_names))
         resolved_target_box_names = (
             list(dict.fromkeys(target_box_names))
@@ -297,37 +304,48 @@ class Quel1SkewManager:
         console.print(
             f"Preparing skew measurement system for boxes: {resolved_box_names}"
         )
-        system = self._build_skew_system(
-            box_names=resolved_box_names,
-            clockmaster_ip=clockmaster_ip,
+        own_clockmaster = (
+            None
+            if self._runtime_context.is_connected
+            or self._runtime_context.driver.package_name == "qubecalib"
+            else create_quel_clock_master(clockmaster_ip)
         )
-        console.print("Loading skew settings...")
-        skew = self._runtime_context.driver.Skew.from_yaml(
-            str(skew_yaml_path),
-            box_yaml=str(box_yaml_path),
-            clockmaster_ip=clockmaster_ip,
-            system=system,
-            boxes=[],
-        )
-        self._restrict_skew_targets(
-            skew=skew,
-            target_box_names=resolved_target_box_names,
-        )
-        prepare = getattr(skew, "prepare", None)
-        if callable(prepare):
-            console.print("Applying RF switch settings...")
-            prepare()
-        console.print("Resyncing skew system...")
-        skew.system.resync()
-        console.print("Measuring skew targets...")
-        skew.measure()
-        if estimate:
-            console.print("Estimating skew...")
-            skew.estimate()
-        self._last_skew = skew
-        console.print("Rendering skew plot...")
-        fig = skew.plot()
-        return skew, fig
+        try:
+            system = self._build_skew_system(
+                box_names=resolved_box_names,
+                clockmaster_ip=clockmaster_ip,
+                own_clockmaster=own_clockmaster,
+            )
+            console.print("Loading skew settings...")
+            skew = self._runtime_context.driver.Skew.from_yaml(
+                str(skew_yaml_path),
+                box_yaml=str(box_yaml_path),
+                clockmaster_ip=clockmaster_ip,
+                system=system,
+                boxes=[],
+            )
+            self._restrict_skew_targets(
+                skew=skew,
+                target_box_names=resolved_target_box_names,
+            )
+            prepare = getattr(skew, "prepare", None)
+            if callable(prepare):
+                console.print("Applying RF switch settings...")
+                prepare()
+            console.print("Resyncing skew system...")
+            skew.system.resync()
+            console.print("Measuring skew targets...")
+            skew.measure()
+            if estimate:
+                console.print("Estimating skew...")
+                skew.estimate()
+            self._last_skew = skew
+            console.print("Rendering skew plot...")
+            fig = skew.plot()
+            return skew, fig
+        finally:
+            if own_clockmaster is not None:
+                own_clockmaster.terminate()
 
     @staticmethod
     def _restrict_skew_targets(
@@ -359,6 +377,7 @@ class Quel1SkewManager:
         *,
         box_names: list[str],
         clockmaster_ip: str,
+        own_clockmaster: Any | None,
     ) -> Quel1System:
         """Build a temporary `Quel1System` for skew measurement without db reconnect path."""
         driver = self._runtime_context.driver
@@ -367,6 +386,8 @@ class Quel1SkewManager:
             connected_system = self._runtime_context.quel1system
             clockmaster = connected_system._clockmaster  # noqa: SLF001
             existing_boxes = dict(connected_system.boxes)
+        elif own_clockmaster is not None:
+            clockmaster = own_clockmaster
         else:
             clockmaster = driver.QuBEMasterClient(clockmaster_ip)
 

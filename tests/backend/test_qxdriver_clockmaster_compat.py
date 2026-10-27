@@ -32,19 +32,19 @@ class _FakeQuelClockMasterV1:
     def __init__(
         self,
         ipaddr: str,
-        boxes: Collection[Any],
         allow_automatic_boot: bool = True,
     ) -> None:
         self.ipaddr = ipaddr
         self.allow_automatic_boot = allow_automatic_boot
-        self._boxes = set(boxes)
+        self._boxes: set[Any] = set()
         self.sync_calls = 0
         self.terminate_calls = 0
         self.counter = 123_456
         self.instances.append(self)
 
-    def sync_boxes(self) -> None:
-        """Record one sync request."""
+    def sync_boxes(self, boxes: Collection[Any]) -> None:
+        """Record one sync request and the boxes given to it."""
+        self._boxes = set(boxes)
         self.sync_calls += 1
 
     def get_current_timecounter(self) -> int:
@@ -57,7 +57,7 @@ class _FakeQuelClockMasterV1:
 
     @property
     def box_count(self) -> int:
-        """Return the number of boxes currently associated with the master."""
+        """Return the number of boxes given to the last sync."""
         return len(self._boxes)
 
 

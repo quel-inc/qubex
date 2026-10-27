@@ -22,8 +22,10 @@ from qubex.backend.quel1.compat.qubecalib_protocols import (
     ActionProtocol,
     AwgSettingProtocol,
     CaptureParamMap as DriverCaptureParamMap,
+    ClockMasterProtocol,
     MultiActionProtocol,
     PortType,
+    QuBEMasterClientProtocol,
     Quel1BoxCommonProtocol,
     Quel1SystemProtocol,
     RunitSettingProtocol,
@@ -846,7 +848,13 @@ def build_parallel_multi_action(
     _validate_box_names(system=system, settings_by_box=settings_by_box)
 
     if clock_health_checks.read_master_clock:
-        logger.debug(f"clock of master: {system._clockmaster.read_clock()}")
+        clockmaster = system._clockmaster
+        master_clock = (
+            cast(QuBEMasterClientProtocol, clockmaster).read_clock()
+            if driver_package_name == "qubecalib"
+            else cast(ClockMasterProtocol, clockmaster).get_current_timecounter()
+        )
+        logger.debug(f"clock of master: {master_clock}")
     actions = _build_single_actions_parallel(
         settings_by_box=settings_by_box,
         system=system,

@@ -100,9 +100,14 @@ class BoxPoolProtocol(Protocol):
     _boxes: dict[str, tuple[Quel1BoxCommonProtocol, SequencerClientProtocol]]
     _linkstatus: dict[str, bool]
     _box_config_cache: dict[str, dict[str, Any]]
+    _clock_master: AnyClockMaster | None
 
     def create_clock_master(self, *, ipaddr: str) -> None:
         """Create clock master client for the pool."""
+        ...
+
+    def set_clock_master(self, master: ClockMasterProtocol) -> None:
+        """Use a clock master created by the caller (qxdriver-quel1 only)."""
         ...
 
     def create(
@@ -394,6 +399,22 @@ class PortConfigAcquirerProtocol(Protocol):
         ...
 
 
+class ClockMasterProtocol(Protocol):
+    """Protocol for the clock master of quel_ic_config (`QuelClockMasterV1`)."""
+
+    def get_current_timecounter(self) -> int:
+        """Read the counter of the clock master."""
+        ...
+
+    def sync_boxes(self, boxes: Sequence[Any]) -> None:
+        """Synchronize the counters of the boxes given together."""
+        ...
+
+    def terminate(self) -> None:
+        """Release the lock of the clock master."""
+        ...
+
+
 class QuBEMasterClientProtocol(Protocol):
     """Protocol for clock-master client compatibility wrappers."""
 
@@ -417,6 +438,9 @@ class QuBEMasterClientProtocol(Protocol):
     def reset(self) -> bool:
         """Reset clock master when supported by the backend."""
         ...
+
+
+AnyClockMaster: TypeAlias = "QuBEMasterClientProtocol | ClockMasterProtocol"
 
 
 class QubeCalibProtocol(Protocol):
@@ -620,7 +644,7 @@ class Quel1SystemProtocol(Protocol):
 
     boxes: Mapping[str, Quel1BoxProtocol]
     box: Mapping[str, Quel1BoxProtocol]
-    _clockmaster: QuBEMasterClientProtocol
+    _clockmaster: AnyClockMaster
     timing_shift: dict[str, int]
     displacement: int
     config_cache: dict[str, dict[str, Any]]
@@ -630,7 +654,7 @@ class Quel1SystemProtocol(Protocol):
     def create(
         cls,
         *,
-        clockmaster: QuBEMasterClientProtocol,
+        clockmaster: AnyClockMaster,
         boxes: Sequence[NamedBoxProtocol],
         update_copnfig_cache: bool = False,
     ) -> Quel1SystemProtocol:

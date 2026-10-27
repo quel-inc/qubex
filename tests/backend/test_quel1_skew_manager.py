@@ -9,6 +9,7 @@ from typing import Any, ClassVar, cast
 import pytest
 import yaml
 
+from qubex.backend.quel1.managers import skew_manager
 from qubex.backend.quel1.managers.skew_manager import Quel1SkewManager
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
@@ -145,11 +146,23 @@ class _FakeQuBEMasterClient:
         _FakeQuBEMasterClient.create_calls.append(ipaddr)
 
 
+class _FakeClockMaster:
+    def __init__(self, ipaddr: str) -> None:
+        self.ipaddr = ipaddr
+        self.terminate_calls = 0
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+
 class _FakeDriver:
     Skew = _FakeSkewClass
     NamedBox = _FakeNamedBox
     Quel1System = _FakeQuel1SystemClass
     QuBEMasterClient = _FakeQuBEMasterClient
+
+    def __init__(self, *, package_name: str) -> None:
+        self.package_name = package_name
 
 
 class _FakeRuntimeContext:
@@ -160,8 +173,9 @@ class _FakeRuntimeContext:
         is_connected: bool,
         connected_system: _FakeSkewSystem | None,
         sysdb: _FakeSysDb,
+        package_name: str = "qxdriver_quel1",
     ) -> None:
-        self.driver = _FakeDriver()
+        self.driver = _FakeDriver(package_name=package_name)
         self.qubecalib = _FakeQubeCalib(sysdb=sysdb)
         self._available_boxes = available_boxes
         self._is_connected = is_connected
@@ -182,6 +196,20 @@ class _FakeRuntimeContext:
         self.validated_box_names.append(box_name)
         if box_name not in self._available_boxes:
             raise ValueError(f"Box {box_name} not available")
+
+
+@pytest.fixture(autouse=True)
+def clock_masters(monkeypatch: pytest.MonkeyPatch) -> list[_FakeClockMaster]:
+    """Record the clock masters of quel_ic_config created for a measurement."""
+    created: list[_FakeClockMaster] = []
+
+    def _create(ipaddr: str) -> _FakeClockMaster:
+        master = _FakeClockMaster(ipaddr)
+        created.append(master)
+        return master
+
+    monkeypatch.setattr(skew_manager, "create_quel_clock_master", _create)
+    return created
 
 
 def _reset_fakes() -> None:
@@ -282,6 +310,7 @@ def test_run_skew_measurement_creates_all_boxes_with_default_reconnect_when_disc
         is_connected=False,
         connected_system=None,
         sysdb=sysdb,
+        package_name="qubecalib",
     )
     manager = Quel1SkewManager(runtime_context=cast(Any, runtime_context))
 
@@ -306,6 +335,58 @@ def test_run_skew_measurement_creates_all_boxes_with_default_reconnect_when_disc
     assert "system" in from_yaml_call
     create_call = _FakeQuel1SystemClass.create_calls[-1]
     assert create_call["update_copnfig_cache"] is True
+
+
+def test_run_skew_measurement_terminates_own_quel_clock_master_when_disconnected(
+    clock_masters: list[_FakeClockMaster],
+) -> None:
+    """Given qxdriver and no connection, the measurement uses its own clock master and releases it."""
+    _reset_fakes()
+    runtime_context = _FakeRuntimeContext(
+        available_boxes=["A", "R"],
+        is_connected=False,
+        connected_system=None,
+        sysdb=_FakeSysDb(),
+    )
+    manager = Quel1SkewManager(runtime_context=cast(Any, runtime_context))
+
+    manager.run_skew_measurement(
+        skew_yaml_path="skew.yaml",
+        box_yaml_path="box.yaml",
+        clockmaster_ip="192.0.2.1",
+        box_names=["A", "R"],
+        estimate=False,
+    )
+
+    assert [master.ipaddr for master in clock_masters] == ["192.0.2.1"]
+    assert _FakeQuel1SystemClass.create_calls[-1]["clockmaster"] is clock_masters[0]
+    assert clock_masters[0].terminate_calls == 1
+    assert _FakeQuBEMasterClient.create_calls == []
+
+
+def test_run_skew_measurement_terminates_own_quel_clock_master_on_failure(
+    clock_masters: list[_FakeClockMaster],
+) -> None:
+    """Given qxdriver and no connection, a failed measurement releases its clock master."""
+    _reset_fakes()
+    runtime_context = _FakeRuntimeContext(
+        available_boxes=["A"],
+        is_connected=False,
+        connected_system=None,
+        sysdb=_FakeSysDb(),
+    )
+    manager = Quel1SkewManager(runtime_context=cast(Any, runtime_context))
+
+    with pytest.raises(ValueError, match="Box R not available"):
+        manager.run_skew_measurement(
+            skew_yaml_path="skew.yaml",
+            box_yaml_path="box.yaml",
+            clockmaster_ip="192.0.2.1",
+            box_names=["A", "R"],
+            estimate=False,
+        )
+
+    assert [master.terminate_calls for master in clock_masters] == [1]
 
 
 def test_run_skew_measurement_passes_empty_boxes_when_system_is_provided() -> None:

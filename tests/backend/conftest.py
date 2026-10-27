@@ -39,12 +39,15 @@ def _stub_qubecalib() -> SimpleNamespace:
 class _Quel1DriverStub:
     """Supply driver defaults compatible with dataclasses.replace in controller tests."""
 
+    package_name: str = "qxdriver_quel1"
     DEFAULT_SAMPLING_PERIOD: float = 2.0
     QubeCalib: Any = _stub_qubecalib
     BoxPool: Any = _unexpected_driver_call
     SequencerClient: Any = _unexpected_driver_call
     QuBEMasterClient: Any = _unexpected_driver_call
     Quel1ConfigOption: Any = _unexpected_driver_call
+    NamedBox: Any = _unexpected_driver_call
+    Quel1System: Any = _unexpected_driver_call
 
 
 @pytest.fixture

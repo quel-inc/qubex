@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
+from qubex.backend.quel1.compat.box_adapter import adapt_quel1_box
 from qubex.backend.quel1.quel1_runtime_context import Quel1RuntimeContextReader
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,15 @@ class Quel1ClockManager:
 
     def read_clocks(self, *, box_list: list[str]) -> list[tuple[bool, int, int]]:
         """Read sequencer clocks for selected boxes."""
+        if not self._uses_qubecalib():
+            return [
+                (
+                    True,
+                    int(adapt_quel1_box(box).get_current_timecounter()),
+                    int(adapt_quel1_box(box).get_latest_sysref_timecounter()),
+                )
+                for box in self._connected_boxes(box_list)
+            ]
         result: list[tuple[bool, int, int]] = []
         for box_name in box_list:
             self._runtime_context.validate_box_availability(box_name)
@@ -43,6 +53,10 @@ class Quel1ClockManager:
         """Resynchronize clocks for selected boxes."""
         if len(box_list) < 2:
             return True
+        if not self._uses_qubecalib():
+            clockmaster = self._connected_quel_clockmaster()
+            clockmaster.sync_boxes(self._connected_boxes(box_list))
+            return self.check_clocks(box_list=box_list)
         master = self._get_connected_clockmaster()
         if master is None:
             clockmaster_ipaddr = self._get_clockmaster_setting_ipaddr()
@@ -56,6 +70,12 @@ class Quel1ClockManager:
 
     def reset_clockmaster(self, *, ipaddr: str) -> bool:
         """Reset the clockmaster endpoint."""
+        if not self._uses_qubecalib():
+            logger.warning(
+                "Clock master reset is not supported by the current quelware "
+                "implementation."
+            )
+            return False
         connected_master = self._get_connected_clockmaster()
         configured_ipaddr = self._get_clockmaster_setting_ipaddr()
         if connected_master is not None and configured_ipaddr == ipaddr:
@@ -71,12 +91,34 @@ class Quel1ClockManager:
             logger.warning("Failed to synchronize clocks.")
         return synchronized
 
+    def _uses_qubecalib(self) -> bool:
+        """Return whether the driver is qubecalib for quelware 0.8."""
+        return self._runtime_context.driver.package_name == "qubecalib"
+
+    def _connected_boxes(self, box_list: list[str]) -> list[Any]:
+        """Return the boxes of the connection, which clock operations need."""
+        boxpool = self._runtime_context.boxpool
+        boxes = []
+        for box_name in box_list:
+            self._runtime_context.validate_box_availability(box_name)
+            if box_name not in boxpool._boxes:
+                raise ValueError(f"box({box_name}) is not connected")
+            boxes.append(boxpool._boxes[box_name][0])
+        return boxes
+
+    def _connected_quel_clockmaster(self) -> Any:
+        """Return the clock master of `quel_ic_config` owned by the connection."""
+        clockmaster = self._runtime_context.boxpool._clock_master
+        if clockmaster is None:
+            raise ValueError("clock master is not found")
+        return clockmaster
+
     def _get_connected_clockmaster(self) -> QuBEMasterClientProtocol | None:
         """Return clockmaster from connected runtime system when available."""
         if not self._runtime_context.is_connected:
             return None
         quel1system = self._runtime_context.quel1system
-        return quel1system._clockmaster
+        return cast("QuBEMasterClientProtocol", quel1system._clockmaster)
 
     def _resolve_box_sss_ip(self, box_name: str) -> str:
         """Resolve sequencer-service IP address for one box."""
