@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, cast
 
 import pytest
 
 from qubex.backend.quel1.quel1_backend_controller import Quel1BackendController
+from qubex.backend.quel1.quel1_runtime_context import NOT_CONNECTED_ERROR_MESSAGE
 
 pytestmark = pytest.mark.usefixtures("stub_quel1_driver")
 
@@ -85,12 +88,57 @@ class _FakeQuel1System:
         self._clockmaster = clockmaster
 
 
+class _FakeBox:
+    def __init__(self, *, current: int, sysref: int) -> None:
+        self.current = current
+        self.sysref = sysref
+
+    def get_current_timecounter(self) -> int:
+        """Return the preconfigured current counter."""
+        return self.current
+
+    def get_latest_sysref_timecounter(self) -> int:
+        """Return the preconfigured SYSREF counter."""
+        return self.sysref
+
+
+class _FakeClockMaster:
+    def __init__(self) -> None:
+        self.sync_calls: list[list[_FakeBox]] = []
+
+    def sync_boxes(self, boxes: list[_FakeBox]) -> None:
+        """Record the boxes synchronized together."""
+        self.sync_calls.append(list(boxes))
+
+
+class _FakeBoxPool:
+    def __init__(
+        self, *, boxes: dict[str, _FakeBox], clock_master: _FakeClockMaster | None
+    ) -> None:
+        self._boxes = {name: (box, object()) for name, box in boxes.items()}
+        self._clock_master = clock_master
+
+
 def _make_controller(*, include_clockmaster: bool = True) -> Quel1BackendController:
     controller = Quel1BackendController()
     fake_qubecalib = _FakeQubeCalib(include_clockmaster=include_clockmaster)
     cast(Any, controller)._qubecalib = fake_qubecalib
     cast(Any, controller)._runtime_context._qubecalib = fake_qubecalib
     return controller
+
+
+def _connect(
+    controller: Quel1BackendController,
+    *,
+    boxes: dict[str, _FakeBox],
+    clock_master: _FakeClockMaster | None,
+) -> None:
+    controller._connection_manager.set_connected_state(
+        boxpool=cast(Any, _FakeBoxPool(boxes=boxes, clock_master=clock_master)),
+        quel1system=cast(Any, object()),
+        cap_resource_map={},
+        gen_resource_map={},
+    )
 
 
 def _override_driver_classes(
@@ -109,7 +157,9 @@ def test_read_clocks_uses_sequencer_clients() -> None:
         "10.0.1.1": (True, 123, 456),
         "10.0.1.2": (True, 789, 1011),
     }
-    _override_driver_classes(controller, SequencerClient=_FakeSequencerClient)
+    _override_driver_classes(
+        controller, package_name="qubecalib", SequencerClient=_FakeSequencerClient
+    )
 
     result = controller.read_clocks(["A", "B"])
 
@@ -128,6 +178,7 @@ def test_resync_clocks_kicks_clockmaster() -> None:
 
     _override_driver_classes(
         controller,
+        package_name="qubecalib",
         SequencerClient=_FakeSequencerClient,
         QuBEMasterClient=lambda master_ipaddr: master,
     )
@@ -154,6 +205,7 @@ def test_resync_clocks_reuses_connected_quel1system_clockmaster() -> None:
 
     _override_driver_classes(
         controller,
+        package_name="qubecalib",
         SequencerClient=_FakeSequencerClient,
         QuBEMasterClient=_raise_if_instantiated,
     )
@@ -165,7 +217,9 @@ def test_resync_clocks_reuses_connected_quel1system_clockmaster() -> None:
 def test_resync_clocks_raises_without_clockmaster() -> None:
     """Given no clockmaster, resync_clocks raises ValueError."""
     controller = _make_controller(include_clockmaster=False)
-    _override_driver_classes(controller, QuBEMasterClient=_FakeQuBEMasterClient)
+    _override_driver_classes(
+        controller, package_name="qubecalib", QuBEMasterClient=_FakeQuBEMasterClient
+    )
 
     with pytest.raises(ValueError, match="clock master is not found"):
         controller.resync_clocks(["A", "B"])
@@ -178,6 +232,7 @@ def test_reset_clockmaster_uses_master_client() -> None:
 
     _override_driver_classes(
         controller,
+        package_name="qubecalib",
         QuBEMasterClient=lambda master_ipaddr: master,
     )
 
@@ -199,6 +254,7 @@ def test_reset_clockmaster_reuses_connected_quel1system_clockmaster() -> None:
 
     _override_driver_classes(
         controller,
+        package_name="qubecalib",
         QuBEMasterClient=_raise_if_instantiated,
     )
 
@@ -206,20 +262,79 @@ def test_reset_clockmaster_reuses_connected_quel1system_clockmaster() -> None:
     assert master.reset_calls == 1
 
 
-def test_reset_clockmaster_returns_false_when_reset_is_unsupported() -> None:
-    """Given compatibility client reset failure, reset_clockmaster returns False."""
+def test_reset_clockmaster_returns_false_when_reset_is_unsupported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Given qxdriver, reset_clockmaster warns and returns False without a client."""
     controller = _make_controller()
 
-    class _MasterWithUnsupportedReset:
-        def __init__(self, master_ipaddr: str) -> None:
-            self.master_ipaddr = master_ipaddr
+    with caplog.at_level(logging.WARNING):
+        assert controller.reset_clockmaster("192.0.2.99") is False
 
-        def reset(self) -> bool:
-            return False
+    assert "Clock master reset is not supported" in caplog.text
 
-    _override_driver_classes(
+
+def test_read_clocks_reads_connected_boxes() -> None:
+    """Given qxdriver, read_clocks reads the counters of the connected boxes."""
+    controller = _make_controller()
+    _connect(
         controller,
-        QuBEMasterClient=_MasterWithUnsupportedReset,
+        boxes={
+            "A": _FakeBox(current=123, sysref=456),
+            "B": _FakeBox(current=789, sysref=1011),
+        },
+        clock_master=_FakeClockMaster(),
     )
 
-    assert controller.reset_clockmaster("192.0.2.99") is False
+    assert controller.read_clocks(["A", "B"]) == [(True, 123, 456), (True, 789, 1011)]
+
+
+def test_read_clocks_raises_for_box_out_of_connection() -> None:
+    """Given qxdriver, read_clocks rejects a box that the connection does not hold."""
+    controller = _make_controller()
+    _connect(
+        controller,
+        boxes={"A": _FakeBox(current=123, sysref=456)},
+        clock_master=_FakeClockMaster(),
+    )
+
+    with pytest.raises(ValueError, match=r"box\(B\) is not connected"):
+        controller.read_clocks(["A", "B"])
+
+
+def test_read_clocks_raises_when_disconnected() -> None:
+    """Given qxdriver and no connection, read_clocks raises the not-connected error."""
+    controller = _make_controller()
+
+    with pytest.raises(ValueError, match=re.escape(NOT_CONNECTED_ERROR_MESSAGE)):
+        controller.read_clocks(["A", "B"])
+
+
+def test_resync_clocks_syncs_connected_boxes_together() -> None:
+    """Given qxdriver, resync_clocks syncs the connected boxes in one call and checks."""
+    controller = _make_controller()
+    boxes = {
+        "A": _FakeBox(current=123_456_789_000, sysref=123_456_789_999),
+        "B": _FakeBox(current=123_456_789_000, sysref=123_456_789_999),
+    }
+    master = _FakeClockMaster()
+    _connect(controller, boxes=boxes, clock_master=master)
+
+    assert controller.resync_clocks(["A", "B"]) is True
+    assert master.sync_calls == [[boxes["A"], boxes["B"]]]
+
+
+def test_resync_clocks_raises_without_quel_clockmaster() -> None:
+    """Given qxdriver and a connection without clock master, resync_clocks raises."""
+    controller = _make_controller(include_clockmaster=False)
+    _connect(
+        controller,
+        boxes={
+            "A": _FakeBox(current=1, sysref=1),
+            "B": _FakeBox(current=1, sysref=1),
+        },
+        clock_master=None,
+    )
+
+    with pytest.raises(ValueError, match="clock master is not found"):
+        controller.resync_clocks(["A", "B"])

@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from qubex.backend.quel1.managers import connection_manager
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
 )
@@ -46,15 +48,30 @@ class _FakeBox:
         return {"box": self.name}
 
 
+class _FakeClockMaster:
+    def __init__(self, ipaddr: str) -> None:
+        self.ipaddr = ipaddr
+        self.terminate_calls = 0
+
+    def terminate(self) -> None:
+        """Record one terminate request."""
+        self.terminate_calls += 1
+
+
 class _FakeBoxPool:
     def __init__(self) -> None:
         self._boxes: dict[str, tuple[_FakeBox, object]] = {}
         self._linkstatus: dict[str, bool] = {}
+        self._clock_master: _FakeClockMaster | None = None
         self.clockmaster_ip: str | None = None
 
     def create_clock_master(self, *, ipaddr: str) -> None:
         """Store clockmaster IP."""
         self.clockmaster_ip = ipaddr
+
+    def set_clock_master(self, master: _FakeClockMaster) -> None:
+        """Store the clock master created by the caller."""
+        self._clock_master = master
 
     def create(
         self,
@@ -116,6 +133,20 @@ def _override_driver_classes(
     """Replace selected driver classes in one controller instance."""
     driver = replace(cast(Any, controller.driver), **overrides)
     cast(Any, controller)._runtime_context._driver = driver
+
+
+@pytest.fixture(autouse=True)
+def clock_masters(monkeypatch: pytest.MonkeyPatch) -> list[_FakeClockMaster]:
+    """Record the clock masters of quel_ic_config created by the connection."""
+    created: list[_FakeClockMaster] = []
+
+    def _create(ipaddr: str) -> _FakeClockMaster:
+        master = _FakeClockMaster(ipaddr)
+        created.append(master)
+        return master
+
+    monkeypatch.setattr(connection_manager, "create_quel_clock_master", _create)
+    return created
 
 
 def test_connect_uses_boxpool_by_default(monkeypatch) -> None:
@@ -183,6 +214,7 @@ def test_create_boxpool_reconnects_all_boxes(monkeypatch) -> None:
     controller = _make_controller()
     _override_driver_classes(
         controller,
+        package_name="qubecalib",
         BoxPool=_FakeBoxPool,
         SequencerClient=lambda _ipaddr: object(),
     )
@@ -202,6 +234,120 @@ def test_create_boxpool_reconnects_all_boxes(monkeypatch) -> None:
     ]
     assert boxpool._boxes["B"][0].reconnect_calls == [
         {"background_noise_threshold": DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT}
+    ]
+
+
+def test_create_boxpool_sets_quel_clock_master_of_configured_ip(
+    clock_masters: list[_FakeClockMaster],
+) -> None:
+    """Given qxdriver, the pool holds the clock master of the configured IP."""
+    controller = _make_controller()
+    _override_driver_classes(
+        controller,
+        BoxPool=_FakeBoxPool,
+        SequencerClient=lambda _ipaddr: object(),
+    )
+
+    boxpool = cast(
+        _FakeBoxPool,
+        controller._connection_manager.create_boxpool(["A", "B"]),
+    )
+
+    assert [master.ipaddr for master in clock_masters] == ["192.0.2.1"]
+    assert boxpool._clock_master is clock_masters[0]
+    assert clock_masters[0].terminate_calls == 0
+
+
+def _fail_reconnect(self: _FakeBox, **kwargs: Any) -> None:
+    raise RuntimeError("reconnect failed")
+
+
+@pytest.mark.parametrize(
+    ("box_names", "fail_reconnect", "error", "terminate_calls"),
+    [
+        (["A", "Z"], False, ValueError, []),
+        (["A", "B"], True, RuntimeError, [1]),
+    ],
+    ids=["unknown-box", "reconnect-failure"],
+)
+def test_create_boxpool_leaves_no_clock_master_held_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    clock_masters: list[_FakeClockMaster],
+    box_names: list[str],
+    fail_reconnect: bool,
+    error: type[Exception],
+    terminate_calls: list[int],
+) -> None:
+    """Given a failed pool creation, no clock master keeps its lock."""
+    controller = _make_controller()
+    _override_driver_classes(
+        controller,
+        BoxPool=_FakeBoxPool,
+        SequencerClient=lambda _ipaddr: object(),
+    )
+    if fail_reconnect:
+        monkeypatch.setattr(_FakeBox, "reconnect", _fail_reconnect)
+
+    with pytest.raises(error):
+        controller._connection_manager.create_boxpool(box_names)
+
+    assert [master.terminate_calls for master in clock_masters] == terminate_calls
+
+
+def test_connect_terminates_clock_master_when_system_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    clock_masters: list[_FakeClockMaster],
+) -> None:
+    """Given a failure after the pool is created, connect releases the clock master."""
+    controller = _make_controller()
+    _override_driver_classes(
+        controller, BoxPool=_FakeBoxPool, SequencerClient=lambda _ipaddr: object()
+    )
+
+    def _raise(box_names: list[str]) -> Any:
+        raise RuntimeError("system creation failed")
+
+    monkeypatch.setattr(
+        controller._connection_manager, "_create_quel1system_from_boxpool", _raise
+    )
+
+    with pytest.raises(RuntimeError, match="system creation failed"):
+        controller.connect(["A", "B"])
+
+    assert [master.terminate_calls for master in clock_masters] == [1]
+    assert not controller._connection_manager.is_connected
+
+
+def test_create_quel1system_uses_clock_master_of_boxpool(
+    clock_masters: list[_FakeClockMaster],
+) -> None:
+    """Given qxdriver, the system takes the pooled clock master without a client."""
+    controller = _make_controller()
+    create_calls: list[dict[str, Any]] = []
+
+    def _create_system(**kwargs: Any) -> object:
+        create_calls.append(kwargs)
+        return object()
+
+    _override_driver_classes(
+        controller,
+        BoxPool=_FakeBoxPool,
+        SequencerClient=lambda _ipaddr: object(),
+        NamedBox=lambda *, name, box: (name, box),
+        Quel1System=SimpleNamespace(create=_create_system),
+    )
+    boxpool = cast(
+        _FakeBoxPool, controller._connection_manager.create_boxpool(["A", "B"])
+    )
+    controller._connection_manager.set_boxpool(cast(Any, boxpool))
+
+    controller._connection_manager._create_quel1system_from_boxpool(["A", "B"])
+
+    assert len(create_calls) == 1
+    assert create_calls[0]["clockmaster"] is clock_masters[0]
+    assert create_calls[0]["boxes"] == [
+        ("A", boxpool._boxes["A"][0]),
+        ("B", boxpool._boxes["B"][0]),
     ]
 
 
