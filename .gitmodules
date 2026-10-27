@@ -1,7 +1,7 @@
 [submodule "packages/qxdriver-quel1"]
 	path = packages/qxdriver-quel1
-	url = https://github.com/amachino/qxdriver-quel1.git
-	branch = qubex-quelware-v0.10
+	url = https://github.com/quel-inc/qxdriver-quel1.git
+	branch = qubex-quelware-v0.11
 [submodule "packages/qube-calib"]
 	path = packages/qube-calib
 	url = https://github.com/qiqb-osaka/qube-calib.git
