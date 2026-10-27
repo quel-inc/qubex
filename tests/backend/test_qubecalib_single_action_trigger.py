@@ -43,9 +43,20 @@ class _Task:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
 
+    def done(self) -> bool:
+        return True
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        _ = timeout
+        return None
+
     def result(self, timeout: float | None = None) -> Any:
         _ = timeout
         return self._payload
+
+    def cancel(self, timeout: float | None = None) -> bool:
+        _ = timeout
+        return False
 
 
 class _FakeBox:

@@ -15,6 +15,7 @@ from tests._backend_dependencies import require_distributions
 # ruff: noqa: E402
 require_distributions("qxdriver-quel1", "quel-ic-config")
 
+from quel_ic_config import CaptureAbandonedError
 from quel_ic_config.quel1_wave_subsystem import CaptureReturnCode
 from qxdriver_quel1.driver import multi
 from qxdriver_quel1.driver.single import (
@@ -38,18 +39,40 @@ class _Task:
     def __init__(self, payload: Any) -> None:
         self._payload = payload
 
+    def done(self) -> bool:
+        return True
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        _ = timeout
+        return None
+
     def result(self, timeout: float | None = None) -> Any:
         _ = timeout
         return self._payload
+
+    def cancel(self, timeout: float | None = None) -> bool:
+        _ = timeout
+        return False
 
 
 class _FailingTask:
     def __init__(self, error: BaseException) -> None:
         self._error = error
 
+    def done(self) -> bool:
+        return True
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        _ = timeout
+        return self._error
+
     def result(self, timeout: float | None = None) -> Any:
         _ = timeout
         raise self._error
+
+    def cancel(self, timeout: float | None = None) -> bool:
+        _ = timeout
+        return False
 
 
 class _TriggeredCaptureBox:
@@ -90,7 +113,7 @@ def test_single_action_capture_start_forwards_scheduled_timecounter() -> None:
 
 
 def test_single_action_capture_stop_surfaces_trigger_awg_failure_first() -> None:
-    """Triggered single action should surface AWG scheduling failures before capture waits."""
+    """Triggered single action should surface the AWG scheduling failure, not the capture abandoned by it."""
     action = SingleAction(
         box=cast(Any, object()),
         wseqs=MappingProxyType({AwgId(port=0, channel=0): WaveSequence(0, 1)}),
@@ -98,12 +121,13 @@ def test_single_action_capture_stop_surfaces_trigger_awg_failure_first() -> None
         triggers=MappingProxyType({1: AwgId(port=0, channel=0)}),
     )
 
+    awg_failure = RuntimeError("specified timecount (= 1) is too late to schedule")
+    capture_abandoned = CaptureAbandonedError("abandoned")
+    capture_abandoned.__cause__ = awg_failure
     futures = {
         _TRIGGERED_CAPTURE_KEY: (
-            _FailingTask(AssertionError("capture task should not be awaited first")),
-            _FailingTask(
-                RuntimeError("specified timecount (= 1) is too late to schedule")
-            ),
+            _FailingTask(capture_abandoned),
+            _FailingTask(awg_failure),
         )
     }
 
@@ -113,8 +137,19 @@ def test_single_action_capture_stop_surfaces_trigger_awg_failure_first() -> None
 
 @dataclass
 class _CompletedWavegenTask:
+    def done(self) -> bool:
+        return True
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        _ = timeout
+        return None
+
     def result(self, timeout: float | None = None) -> None:
         _ = timeout
+
+    def cancel(self, timeout: float | None = None) -> bool:
+        _ = timeout
+        return False
 
 
 @dataclass
@@ -148,13 +183,13 @@ class _FakeTriggeredAction:
     trigger_settings: dict[str, object]
     capture_start_timecounter: int | None = None
 
-    def capture_start(self, *, timecounter: int | None = None) -> dict[str, str]:
+    def capture_start(self, *, timecounter: int | None = None) -> dict[str, _Task]:
         self.capture_start_timecounter = timecounter
-        return {"P1": "future"}
+        return {"P1": _Task(None)}
 
     def capture_stop(
         self,
-        futures: dict[str, str],
+        futures: dict[str, _Task],
     ) -> tuple[
         dict[str, CaptureReturnCode],
         dict[tuple[str, int], np.ndarray],
