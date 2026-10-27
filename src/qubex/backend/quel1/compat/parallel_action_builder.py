@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import re
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -459,18 +460,72 @@ def _estimate_timediff(
 def _run_per_box_parallel(
     items: Sequence[tuple[str, Any]],
     runner: Callable[[str, Any], Any],
+    *,
+    on_failure: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Run one independent box operation per worker and preserve input order."""
+    """
+    Run one independent box operation per worker and preserve input order.
+
+    All the operations run to their ends. If any of them fails, `on_failure`
+    receives the results of the others that succeeded, and then the first
+    failure in input order is raised.
+    """
     if not items:
         return {}
 
-    def _invoke(item: tuple[str, Any]) -> tuple[str, Any]:
-        name, payload = item
-        return name, runner(name, payload)
-
     max_workers = max(1, len(items))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        return dict(executor.map(_invoke, items))
+        futures = [
+            (name, executor.submit(runner, name, payload)) for name, payload in items
+        ]
+    results: dict[str, Any] = {}
+    failure: BaseException | None = None
+    for name, future in futures:
+        error = future.exception()
+        if error is None:
+            results[name] = future.result()
+        elif failure is None:
+            failure = error
+    if failure is not None:
+        if on_failure is not None:
+            on_failure(results)
+        raise failure
+    return results
+
+
+def _task_windows(futures: Mapping[str, Mapping[Any, Any]]) -> list[Any]:
+    """Return the task windows in per-box capture futures, capture before AWG."""
+    windows: list[Any] = []
+    for box_futures in futures.values():
+        for value in box_futures.values():
+            windows.extend(value if isinstance(value, tuple) else (value,))
+    return windows
+
+
+@dataclass(frozen=True)
+class _ShotBundle:
+    """
+    Functions of qxdriver-quel1 that wait for the shots of an action as a bundle.
+
+    `wait_windows` waits for the windows together, cancels the shots still
+    running when one has failed, and raises that failure rather than the
+    abandonment it causes; `cancel_windows` cancels the shots started before a
+    failed start.
+    """
+
+    wait_windows: Callable[[Sequence[Any]], None]
+    cancel_windows: Callable[[Sequence[Any]], None]
+
+
+def _load_shot_bundle(driver_package_name: str) -> _ShotBundle | None:
+    """Return the shot bundle of qxdriver-quel1, or None for qubecalib of quelware 0.8."""
+    if driver_package_name == "qubecalib":
+        return None
+    compat = importlib.import_module("qxdriver_quel1.compat")
+    return _ShotBundle(
+        wait_windows=compat.wait_windows,
+        cancel_windows=compat.cancel_windows,
+    )
 
 
 @dataclass(frozen=True)
@@ -509,6 +564,7 @@ class QubexMultiAction:
     _logger: Logger
     _emit_triggered_boxes: bool = False
     _arm_triggered_boxes_at_capture_start: bool = False
+    _shot_bundle: _ShotBundle | None = None
 
     SYSREF_PERIOD: Final[int] = 2_000  # 2e3 ticks = 2e3 * 8 ns = 16 us = 62.5 kHz
     TIMING_OFFSET: Final[int] = 0
@@ -550,11 +606,15 @@ class QubexMultiAction:
             for name, action in self._actions.items()
             if self._has_capture_setting(action)
         ]
+        bundle = self._shot_bundle
         return cast(
             dict[str, dict[PortType, Any]],
             _run_per_box_parallel(
                 capture_actions,
                 _start_capture,
+                on_failure=None
+                if bundle is None
+                else lambda started: bundle.cancel_windows(_task_windows(started)),
             ),
         )
 
@@ -566,6 +626,8 @@ class QubexMultiAction:
         dict[tuple[str, PortType, int], Any],
     ]:
         """Stop capture and flatten per-box status/data maps."""
+        if self._shot_bundle is not None:
+            self._shot_bundle.wait_windows(_task_windows(futures))
         box_results = cast(
             dict[str, tuple[dict[PortType, Any], dict[tuple[PortType, int], Any]]],
             _run_per_box_parallel(
@@ -593,10 +655,20 @@ class QubexMultiAction:
             displacement=self._system.displacement
         )
         futures = self.capture_start(scheduled_times=scheduled_times)
-        self.emit_at(
-            displacement=self._system.displacement,
-            scheduled_times=scheduled_times,
-        )
+        bundle = self._shot_bundle
+        if bundle is None:
+            self.emit_at(
+                displacement=self._system.displacement,
+                scheduled_times=scheduled_times,
+            )
+            return self.capture_stop(futures)
+        capture_windows = _task_windows(futures)
+        try:
+            emission_windows = self._start_emission(scheduled_times)
+        except BaseException:
+            bundle.cancel_windows(capture_windows)
+            raise
+        bundle.wait_windows([*capture_windows, *emission_windows])
         return self.capture_stop(futures)
 
     def _build_scheduled_times(
@@ -650,42 +722,50 @@ class QubexMultiAction:
         When clock validation is enabled, this method performs additional
         latched-clock reads and fluctuation checks before scheduling emission.
         """
-        awgs_by_box = {
-            name: {(spec.port, spec.channel) for spec in action._wseqs}
-            for name, action in self._actions.items()
-        }
-        resolved_scheduled_times = (
-            dict(scheduled_times)
+        tasks = self._start_emission(
+            scheduled_times
             if scheduled_times is not None
             else self._build_scheduled_times(
                 min_time_offset=min_time_offset,
                 displacement=displacement,
             )
         )
-        tasks: list[_WavegenTaskProtocol] = []
-        for name, action in self._actions.items():
-            if not self._emit_triggered_boxes and getattr(action, "_triggers", {}):
-                continue
-            scheduled_time = resolved_scheduled_times[name]
-            if awgs_by_box[name]:
-                tasks.append(
-                    action.box.start_wavegen(
-                        awgs_by_box[name],
-                        timecounter=scheduled_time,
-                    )
-                )
-            self._logger.debug(
-                "reserving emission of %s at %s : base_time=%s, timediff=%s, timing_shift=%s",
-                name,
-                scheduled_time,
-                scheduled_time
-                - self._estimated_timediff[name]
-                - self._system.timing_shift[name],
-                self._estimated_timediff[name],
-                self._system.timing_shift[name],
-            )
+        if self._shot_bundle is not None:
+            self._shot_bundle.wait_windows(tasks)
+            return
         for task in tasks:
             task.result()
+
+    def _start_emission(
+        self, scheduled_times: Mapping[str, int]
+    ) -> list[_WavegenTaskProtocol]:
+        """Reserve the emissions of the boxes and return their tasks."""
+        tasks: list[_WavegenTaskProtocol] = []
+        try:
+            for name, action in self._actions.items():
+                if not self._emit_triggered_boxes and getattr(action, "_triggers", {}):
+                    continue
+                scheduled_time = scheduled_times[name]
+                awgs = {(spec.port, spec.channel) for spec in action._wseqs}
+                if awgs:
+                    tasks.append(
+                        action.box.start_wavegen(awgs, timecounter=scheduled_time)
+                    )
+                self._logger.debug(
+                    "reserving emission of %s at %s : base_time=%s, timediff=%s, timing_shift=%s",
+                    name,
+                    scheduled_time,
+                    scheduled_time
+                    - self._estimated_timediff[name]
+                    - self._system.timing_shift[name],
+                    self._estimated_timediff[name],
+                    self._system.timing_shift[name],
+                )
+        except BaseException:
+            if self._shot_bundle is not None:
+                self._shot_bundle.cancel_windows(tasks)
+            raise
+        return tasks
 
 
 def build_parallel_multi_action(
@@ -795,6 +875,7 @@ def build_parallel_multi_action(
         _logger=logger,
         _emit_triggered_boxes=driver_package_name == "qubecalib",
         _arm_triggered_boxes_at_capture_start=driver_package_name != "qubecalib",
+        _shot_bundle=_load_shot_bundle(driver_package_name),
     )
     cprms = _collect_multi_action_cprms(actions=actions)
     return multi_action_instance, cprms
